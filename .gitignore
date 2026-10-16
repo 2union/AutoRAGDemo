@@ -1,0 +1,6 @@
+ARTICLE.md
+qdrant_storage/
+.env
+work
+.DS_store
+__pycache__/

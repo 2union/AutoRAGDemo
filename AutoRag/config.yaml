@@ -1,0 +1,121 @@
+# Конфигурация AutoRAG для подбора RAG-пайплайна по рецептам (русский язык).
+# Каждая vectordb = отдельная модель эмбеддингов; AutoRAG сам проиндексирует corpus в Qdrant.
+vectordb:
+  - name: oai_small
+    db_type: qdrant
+    client_type: docker
+    url: http://qdrant:6333
+    collection_name: autorag_oai_small
+    embedding_model: openai_embed_3_small
+    similarity_metric: cosine
+    dimension: 1536
+    embedding_batch: 64
+  - name: oai_large
+    db_type: qdrant
+    client_type: docker
+    url: http://qdrant:6333
+    collection_name: autorag_oai_large
+    embedding_model: openai_embed_3_large
+    similarity_metric: cosine
+    dimension: 3072
+    embedding_batch: 64
+  - name: bge_m3
+    db_type: qdrant
+    client_type: docker
+    url: http://qdrant:6333
+    collection_name: autorag_bge_m3
+    embedding_model: huggingface_bge_m3
+    similarity_metric: cosine
+    dimension: 1024
+    embedding_batch: 16
+
+node_lines:
+  - node_line_name: retrieve_node_line
+    nodes:
+      # Кандидаты берём с запасом (top_k 20) — дальше их сужает реранкер
+      - node_type: semantic_retrieval
+        strategy:
+          metrics: [retrieval_recall, retrieval_ndcg, retrieval_mrr]
+        top_k: 20
+        modules:
+          - module_type: vectordb
+            vectordb: [oai_small, oai_large, bge_m3]
+      - node_type: lexical_retrieval
+        strategy:
+          metrics: [retrieval_recall, retrieval_ndcg, retrieval_mrr]
+        top_k: 20
+        modules:
+          - module_type: bm25
+            # porter_stemmer не работает с кириллицей — используем токенизатор bge-m3 и пробелы
+            bm25_tokenizer: [BAAI/bge-m3, space]
+      - node_type: hybrid_retrieval
+        strategy:
+          metrics: [retrieval_recall, retrieval_ndcg, retrieval_mrr]
+        top_k: 20
+        modules:
+          - module_type: hybrid_rrf
+            weight_range: (4, 80)
+          - module_type: hybrid_cc
+            normalize_method: [mm, tmm, z, dbsf]
+            weight_range: (0.0, 1.0)
+            test_weight_size: 11
+      # Финальный размер контекста для gpt-5-nano: 5–10 рецептов
+      - node_type: passage_reranker
+        strategy:
+          metrics: [retrieval_recall, retrieval_ndcg, retrieval_mrr]
+        top_k: [5, 10]
+        modules:
+          - module_type: pass_reranker
+          - module_type: flag_embedding_reranker
+            model_name: BAAI/bge-reranker-v2-m3
+
+  - node_line_name: post_retrieve_node_line
+    nodes:
+      - node_type: prompt_maker
+        strategy:
+          metrics:
+            - metric_name: bleu
+            - metric_name: sem_score
+              embedding_model: openai_embed_3_small
+          generator_modules:
+            - module_type: openai_llm
+              llm: gpt-5-nano
+              batch: 8
+        modules:
+          - module_type: fstring
+            prompt:
+              - |
+                Ты ИИ-агент шеф-повар. Выбери из рецептов ниже один, лучше всего подходящий под запрос.
+                Используй только переданные рецепты. Ответь одной фразой: «Подходит рецепт <название> (ID <id>)».
+
+                Рецепты:
+                {retrieved_contents}
+
+                Запрос: {query}
+              - |
+                Запрос пользователя: {query}
+
+                Найденные рецепты (каждый начинается с ID):
+                {retrieved_contents}
+
+                Выбери один рецепт, строго из списка. Формат ответа: «Подходит рецепт <название> (ID <id>)».
+          - module_type: long_context_reorder
+            prompt:
+              - |
+                Ты ИИ-агент шеф-повар. Выбери из рецептов ниже один, лучше всего подходящий под запрос.
+                Используй только переданные рецепты. Ответь одной фразой: «Подходит рецепт <название> (ID <id>)».
+
+                Рецепты:
+                {retrieved_contents}
+
+                Запрос: {query}
+      - node_type: generator
+        strategy:
+          metrics:
+            - metric_name: bleu
+            - metric_name: sem_score
+              embedding_model: openai_embed_3_small
+        modules:
+          - module_type: openai_llm
+            llm: gpt-5-nano
+            batch: 8

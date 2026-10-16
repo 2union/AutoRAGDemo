@@ -1,0 +1,87 @@
+# Образы собираются по одному разу на решение:
+#   rag-direct-index — собирает сервис direct-index, использует direct-index-index;
+#   rag-autorag      — собирает сервис autorag-pipeline, использует autorag-server.
+# Сборка: make -C DirectIndex build / make -C AutoRag build
+# (или docker compose --profile index --profile autorag --profile autorag-pipeline build).
+
+x-direct-index: &direct-index
+  image: rag-direct-index
+  env_file:
+    - path: ./DirectIndex/.env
+      required: false
+  environment:
+    QDRANT_URL: http://qdrant:6333
+    DATA_FILE: /data/recipes.jsonl
+  volumes:
+    - ./Data:/data:ro
+  depends_on:
+    - qdrant
+
+x-autorag: &autorag
+  image: rag-autorag
+  env_file:
+    - path: ./AutoRag/.env
+      required: false
+  depends_on:
+    - qdrant
+
+x-autorag-env: &autorag-env
+  QDRANT_URL: http://qdrant:6333
+  DATA_FILE: /data/recipes.jsonl
+  WORK_DIR: /work
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+
+  # DirectIndex: FastAPI-сервер (собирает образ rag-direct-index)
+  direct-index:
+    <<: *direct-index
+    build: ./DirectIndex
+    ports:
+      - "8000:8000"
+
+  # DirectIndex: разовая индексация Data/recipes.jsonl -> коллекция chef_recipes
+  direct-index-index:
+    <<: *direct-index
+    pull_policy: never
+    profiles: ["index"]
+    command: ["make", "index"]
+
+  # AutoRAG: полный пайплайн prepare -> optimize -> export -> evaluate (собирает образ rag-autorag)
+  autorag-pipeline:
+    <<: *autorag
+    build: ./AutoRag
+    profiles: ["autorag-pipeline"]
+    command: ["make", "pipeline"]
+    environment:
+      <<: *autorag-env
+      SAMPLE: ${SAMPLE:-300}
+      VARIANT: ${VARIANT:-card}
+    volumes:
+      - ./Data:/data:ro
+      - ./AutoRag/work:/work
+      - hf_cache:/cache
+    ports:
+      - "7690:7690"   # make dashboard
+
+  # AutoRAG: продакшн RAG-сервер FastAPI по work/rag_profile.json
+  autorag-server:
+    <<: *autorag
+    pull_policy: never
+    profiles: ["autorag"]
+    command: ["make", "serve"]
+    environment: *autorag-env
+    volumes:
+      - ./AutoRag/work:/work:ro
+      - hf_cache:/cache
+    ports:
+      - "8001:8001"
+
+volumes:
+  hf_cache:
